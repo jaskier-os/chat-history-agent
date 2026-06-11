@@ -1,5 +1,7 @@
 # chat-history-agent
 
+> **Docs & wiki:** [github.com/jaskier-os/docs/wiki](https://github.com/jaskier-os/docs/wiki)
+
 Read-only access to past conversations, for the orchestrator. It exposes the same data
 two ways: as LLM tools registered with the orchestrator (`list_conversations`,
 `search_conversations`, `get_conversation`) and as a REST API on its own HTTP port.
