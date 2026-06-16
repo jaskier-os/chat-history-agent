@@ -8,6 +8,75 @@
 import fs from 'fs/promises';
 import path from 'path';
 
+/**
+ * Fold a conversation's raw NDJSON events into client-facing turns. The
+ * orchestrator persists a turn in two phases: a `turn` line (user half, written
+ * at request start) and a later `turn_response` line (AI half) sharing the same
+ * requestId. This merges them into one object preserving file order, so a turn
+ * whose response has not arrived yet surfaces with response: null (a pending
+ * turn the client renders as "thinking"). A `turn_response` with no preceding
+ * `turn` becomes a standalone turn so the AI text is never dropped.
+ *
+ * Kept in sync with the orchestrator's chat-store.js mergeTurnEvents; this is a
+ * separate service over the same on-disk format, so the logic is duplicated
+ * rather than imported.
+ * @param {object[]} events - parsed NDJSON lines in file order
+ * @returns {object[]} merged turns in original order
+ */
+export function mergeTurnEvents(events) {
+  const turns = [];
+  const byRequestId = new Map();
+
+  for (const e of events) {
+    if (e.type === 'turn') {
+      // Collapse a duplicate pending turn for the same requestId (transport
+      // resend). The existing pending turn is the merge target; drop the dup.
+      if (e.requestId && byRequestId.has(e.requestId)) {
+        continue;
+      }
+      const turn = {
+        type: 'turn',
+        ts: e.ts,
+        requestId: e.requestId,
+        userText: e.userText ?? null,
+        userImage: e.userImage ?? null,
+        classification: e.classification ?? null,
+        response: e.response ?? null,
+        usage: e.usage ?? null,
+        toolCalls: e.toolCalls ?? null
+      };
+      turns.push(turn);
+      if (turn.response == null && turn.requestId) {
+        byRequestId.set(turn.requestId, turn);
+      }
+    } else if (e.type === 'turn_response') {
+      const pending = e.requestId ? byRequestId.get(e.requestId) : null;
+      if (pending) {
+        pending.ts = e.ts ?? pending.ts;
+        pending.classification = e.classification ?? null;
+        pending.response = e.response ?? null;
+        pending.usage = e.usage ?? null;
+        pending.toolCalls = e.toolCalls ?? null;
+        byRequestId.delete(e.requestId);
+      } else {
+        turns.push({
+          type: 'turn',
+          ts: e.ts,
+          requestId: e.requestId,
+          userText: null,
+          userImage: null,
+          classification: e.classification ?? null,
+          response: e.response ?? null,
+          usage: e.usage ?? null,
+          toolCalls: e.toolCalls ?? null
+        });
+      }
+    }
+  }
+
+  return turns;
+}
+
 export class HistoryStore {
   /**
    * @param {string} dataDir - Root directory for chat history data
@@ -133,7 +202,9 @@ export class HistoryStore {
 
         for (const line of lines) {
           const parsed = JSON.parse(line);
-          if (parsed.type !== 'turn') continue;
+          // userText lives on `turn` lines; response.text may live on a legacy
+          // `turn` line or a two-phase `turn_response` line.
+          if (parsed.type !== 'turn' && parsed.type !== 'turn_response') continue;
 
           const userText = parsed.userText || '';
           const responseText = parsed.response?.text || '';
@@ -177,7 +248,7 @@ export class HistoryStore {
 
       const events = lines.map(line => JSON.parse(line));
       const header = events.find(e => e.type === 'header');
-      const turns = events.filter(e => e.type === 'turn');
+      const turns = mergeTurnEvents(events);
       const close = events.find(e => e.type === 'close');
 
       return {
